@@ -18,12 +18,12 @@ from utils.utils import print_arguments, add_arguments
 parser = argparse.ArgumentParser(description=__doc__)
 add_arg = functools.partial(add_arguments, argparser=parser)
 add_arg("test_data",   type=str, default="dataset/test.json",            help="测试集的路径")
-add_arg("model_path",  type=str, default="models/whisper-tiny-finetune", help="合并模型的路径，或者是huggingface上模型的名称")
-add_arg("batch_size",  type=int, default=16,        help="评估的batch size")
+add_arg("model_path",  type=str, default="./merged_model", help="合并模型的路径，或者是huggingface上模型的名称")
+add_arg("batch_size",  type=int, default=2,        help="评估的batch size")
 add_arg("num_workers", type=int, default=8,         help="读取数据的线程数量")
-add_arg("language",    type=str, default="Chinese", help="设置语言，可全称也可简写，如果为None则评估的是多语言")
+add_arg("language",    type=str, default=None, help="设置语言，可全称也可简写，如果为None则评估的是多语言")
 add_arg("remove_pun",  type=bool, default=True,     help="是否移除标点符号")
-add_arg("to_simple",   type=bool, default=True,     help="是否转为简体中文")
+add_arg("to_simple",   type=bool, default=False,     help="是否转为简体中文")
 add_arg("timestamps",  type=bool, default=False,    help="评估时是否使用时间戳数据")
 add_arg("min_audio_len",     type=float, default=0.5,  help="最小的音频长度，单位秒")
 add_arg("max_audio_len",     type=float, default=30,   help="最大的音频长度，单位秒")
@@ -45,16 +45,17 @@ if platform.system() == "Windows":
 def main():
     # 获取Whisper的数据处理器，这个包含了特征提取器、tokenizer
     processor = WhisperProcessor.from_pretrained(args.model_path,
-                                                 language=args.language,
-                                                 task=args.task,
-                                                 no_timestamps=not args.timestamps,
-                                                 local_files_only=args.local_files_only)
+                                             language=args.language,
+                                             task=args.task,
+                                             no_timestamps=not args.timestamps,
+                                             local_files_only=args.local_files_only)
     # 获取模型
     model = WhisperForConditionalGeneration.from_pretrained(args.model_path,
-                                                            device_map="auto",
-                                                            local_files_only=args.local_files_only)
-    model.generation_config.language = args.language.lower()
-    model.generation_config.forced_decoder_ids = None
+                                                       device_map="auto",
+                                                       local_files_only=args.local_files_only)
+    if args.language is not None:  # 只有当语言不是None时才设置
+        model.generation_config.language = args.language.lower()
+    model.generation_config.forced_decoder_ids = None  # 确保强制解码器ID被禁用
     model.eval()
 
     # 获取测试数据
