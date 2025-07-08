@@ -193,6 +193,8 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+echo "*.pyc" >> .gitignore
+echo "__pycache__/" >> .gitignore
 
 # Cursor
 #  Cursor is an AI-powered code editor. `.cursorignore` specifies files/directories to
