@@ -166,7 +166,7 @@ class CustomDataset(Dataset):
         try:
             # 从数据列表里面获取音频数据、采样率和文本
             sample, sample_rate, transcript, language = self._get_list_data(idx=idx)
-            print(f"成功读取音频: {self.data_list[idx]['audio']['path']}, 时长: {self.data_list[idx]['duration']}, 语言: {language}")
+            #print(f"成功读取音频: {self.data_list[idx]['audio']['path']}, 时长: {self.data_list[idx]['duration']}, 语言: {language}")
             # 可以为单独数据设置语言
             self.processor.tokenizer.set_prefix_tokens(language=language if language is not None else self.language)
             if len(transcript) > 0:
