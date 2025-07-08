@@ -193,8 +193,7 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
-echo "*.pyc" >> .gitignore
-echo "__pycache__/" >> .gitignore
+
 
 # Cursor
 #  Cursor is an AI-powered code editor. `.cursorignore` specifies files/directories to
@@ -207,3 +206,5 @@ echo "__pycache__/" >> .gitignore
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+*.pyc
+__pycache__/
