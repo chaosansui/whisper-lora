@@ -6,117 +6,273 @@ import soundfile
 from pydub import AudioSegment
 from tqdm import tqdm
 import logging
-import random
 import re
 import argparse
+import librosa
+import shutil
+from pathlib import Path
 
+# 设置日志
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 def unpack(filepath, target_dir):
+    """解压压缩文件到目标目录"""
     try:
+        os.makedirs(target_dir, exist_ok=True)
         if filepath.endswith('.tar.gz'):
             with tarfile.open(filepath, 'r:gz') as tar:
                 tar.extractall(path=target_dir)
         elif filepath.endswith('.zip'):
             with zipfile.ZipFile(filepath, 'r') as zip_ref:
                 zip_ref.extractall(target_dir)
+        else:
+            raise ValueError("不支持的压缩包格式，请使用 .tar.gz 或 .zip")
         logger.info(f"解压完成 -> {target_dir}")
     except Exception as e:
+        logger.error(f"解压失败: {str(e)}")
         raise RuntimeError(f"解压失败: {str(e)}")
 
-def resample_audio_to_16k(audio_path, output_path, target_sr=16000):
-    """统一将音频采样率转换为16000Hz"""
+def parse_timestamp(timestamp_str):
+    """解析时间戳字符串，支持 HH:MM:SS, MM:SS, SS 格式"""
     try:
-        # 根据文件扩展名选择读取方式
-        if audio_path.lower().endswith('.mp3'):
-            audio = AudioSegment.from_mp3(audio_path)
-        elif audio_path.lower().endswith('.wav'):
-            audio = AudioSegment.from_wav(audio_path)
+        clean_str = re.sub(r'[^\d:]', '', timestamp_str)
+        parts = clean_str.split(':')
+        
+        if len(parts) == 3:
+            h, m, s = map(int, parts)
+            return h * 3600 + m * 60 + s
+        elif len(parts) == 2:
+            m, s = map(int, parts)
+            return m * 60 + s
+        elif len(parts) == 1:
+            return int(parts[0])
         else:
-            audio = AudioSegment.from_file(audio_path)
-        
-        # 转换采样率
-        if audio.frame_rate != target_sr:
-            audio = audio.set_frame_rate(target_sr)
-            logger.info(f"音频 {audio_path} 采样率从 {audio.frame_rate} 转换为 {target_sr}")
-        
-        # 转换为单声道
-        if audio.channels > 1:
-            audio = audio.set_channels(1)
-            logger.info(f"音频 {audio_path} 从 {audio.channels} 声道转换为单声道")
-        
-        # 导出为WAV格式
-        audio.export(output_path, format="wav")
-        return True
+            raise ValueError("无法识别的时间戳格式")
     except Exception as e:
-        logger.error(f"重采样音频 {audio_path} 失败: {str(e)}")
-        return False
-
-def check_audio(audio_path, expected_sr=16000):
-    """检查音频文件并返回时长"""
-    try:
-        samples, sr = soundfile.read(audio_path)
-        duration = round(len(samples) / sr, 2)
-        
-        if sr != expected_sr:
-            logger.warning(f"{audio_path} 的采样率 {sr} 不符合预期 {expected_sr}")
-            return None
-        
-        return duration
-    except Exception as e:
-        logger.error(f"读取音频文件 {audio_path} 失败: {str(e)}")
-        return None
+        logger.warning(f"时间戳解析失败: {timestamp_str} - {str(e)}")
+        raise ValueError(f"时间戳解析失败: {timestamp_str} - {str(e)}")
 
 def preprocess_text(text):
-    """预处理文本，去除多余空格"""
-    return " ".join(text.strip().split())
+    """
+    清理文本，保留中文、英文、数字和常见标点。
+    """
+    if not text:
+        return ""
+    
+    text = re.sub(r'[^\w\s\u4e00-\u9fff，。？！、：；""''（）《》【】.,!?]', '', text)
+    text = ' '.join(text.strip().split())
+    
+    return text
 
-def parse_timestamp(timestamp_str):
-    """解析时间戳 [HH:MM:SS] 格式"""
-    try:
-        # 去掉方括号
-        timestamp_str = timestamp_str.strip('[]')
-        parts = timestamp_str.split(':')
-        if len(parts) == 3:
-            hours, minutes, seconds = map(int, parts)
-            return hours * 3600 + minutes * 60 + seconds
+def count_text_length(text, method='char'):
+    """计算文本长度"""
+    if method == 'char':
+        return len(text)
+    elif method == 'word':
+        chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', text))
+        english_words = len(re.findall(r'[a-zA-Z]+', text))
+        return chinese_chars + english_words
+    elif method == 'token':
+        chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', text))
+        english_chars = len(re.findall(r'[a-zA-Z]', text))
+        return chinese_chars + english_chars // 4
+    else:
+        return len(text)
+
+def split_sentences_by_length(sentences, max_length=200, method='char'):
+    """按句子长度切分句子组"""
+    if not sentences:
+        return []
+    
+    groups = []
+    current_group = []
+    current_length = 0
+    
+    for sentence in sentences:
+        text = sentence['text']
+        text_length = count_text_length(text, method)
+        
+        if text_length > max_length:
+            if current_group:
+                groups.append(current_group)
+                current_group = []
+                current_length = 0
+            
+            split_sentences = split_long_sentence(sentence, max_length, method)
+            groups.extend([[s] for s in split_sentences])
+            continue
+        
+        if current_length + text_length > max_length and current_group:
+            groups.append(current_group)
+            current_group = [sentence]
+            current_length = text_length
         else:
-            raise ValueError(f"时间戳格式错误: {timestamp_str}")
-    except Exception as e:
-        raise ValueError(f"解析时间戳失败: {timestamp_str} - {str(e)}")
+            current_group.append(sentence)
+            current_length += text_length
+    
+    if current_group:
+        groups.append(current_group)
+    
+    logger.info(f"句子切分完成: {len(sentences)} 句 -> {len(groups)} 组")
+    return groups
 
-def parse_transcript_content(content):
-    """解析对话转录内容"""
+def split_long_sentence(sentence, max_length, method='char'):
+    """切分过长的单个句子"""
+    text = sentence['text']
+    if count_text_length(text, method) <= max_length:
+        return [sentence]
+    
+    delimiters = ['。', '！', '？', '.', '!', '?', '；', ';', '，', ',']
+    parts = []
+    current_part = ""
+    
+    for char in text:
+        current_part += char
+        if char in delimiters:
+            if count_text_length(current_part, method) <= max_length:
+                parts.append(current_part.strip())
+                current_part = ""
+            else:
+                if parts:
+                    parts[-1] += current_part
+                else:
+                    parts.append(current_part.strip())
+                current_part = ""
+    
+    if current_part.strip():
+        if parts and count_text_length(parts[-1] + current_part, method) <= max_length:
+            parts[-1] += current_part
+        else:
+            parts.append(current_part.strip())
+    
+    result = []
+    duration = sentence['end'] - sentence['start']
+    part_duration = duration / len(parts) if parts else duration
+    
+    for i, part in enumerate(parts):
+        if part.strip():
+            new_sentence = {
+                'start': sentence['start'] + i * part_duration,
+                'end': sentence['start'] + (i + 1) * part_duration,
+                'text': part.strip()
+            }
+            if 'speaker' in sentence:
+                new_sentence['speaker'] = sentence['speaker']
+            result.append(new_sentence)
+    
+    return result
+
+def parse_transcript_content(content, filename):
+    """解析文本内容，支持 AF 文件（带客服/客人标签）和 youtube 文件（无标签）"""
+    logger.info(f"解析文件: {filename}")
+    logger.debug(f"文件内容:\n{content}")
     lines = content.strip().split('\n')
     parsed_segments = []
+    current_time = 0
     
     for line in lines:
         line = line.strip()
         if not line:
             continue
-            
-        # 匹配格式: [HH:MM:SS] 说话人: 内容
-        match = re.match(r'(\[\d{2}:\d{2}:\d{2}\])\s+([^:]+):\s*(.+)', line)
-        if match:
-            timestamp_str, speaker, text = match.groups()
-            try:
-                start_time = parse_timestamp(timestamp_str)
-                text = preprocess_text(text)
-                if text:  # 确保文本不为空
-                    parsed_segments.append({
-                        'start': start_time,
-                        'speaker': speaker.strip(),
-                        'text': text
-                    })
-            except ValueError as e:
-                logger.warning(f"跳过无效行: {line} - {e}")
-                continue
+        logger.debug(f"处理行: {line}")
+        
+        if filename.startswith("AF"):
+            match = re.match(r'\[(\d{2}:\d{2}:\d{2})\]\s+(客服|客人):\s*(.+)', line)
+            if match:
+                timestamp_str, speaker, text = match.groups()
+                try:
+                    current_time = parse_timestamp(timestamp_str)
+                    if text := text.strip():
+                        parsed_segments.append({
+                            'start': current_time,
+                            'text': preprocess_text(text),
+                            'speaker': speaker
+                        })
+                    continue
+                except ValueError as e:
+                    logger.warning(f"时间戳解析失败: {line} - {e}")
+        
+        elif filename.startswith("youtube"):
+            match = re.match(r'\[?(\d{2}:\d{2}:\d{2})\]?\s*(.*)', line)
+            if match:
+                timestamp_str, raw_text = match.groups()
+                try:
+                    current_time = parse_timestamp(timestamp_str)
+                    cleaned_text = re.sub(r'^\s*\d+\s*', '', raw_text, count=1) 
+                    
+                    if cleaned_text := cleaned_text.strip():
+                        parsed_segments.append({
+                            'start': current_time,
+                            'text': preprocess_text(cleaned_text)
+                        })
+                    continue
+                except ValueError as e:
+                    logger.warning(f"时间戳解析失败: {line} - {e}")
+        
+        if line:
+            parsed_segments.append({
+                'start': current_time,
+                'text': preprocess_text(line)
+            })
+            current_time += 3.0
     
-    return parsed_segments
+    final_segments = []
+    for segment in parsed_segments:
+        text = segment.get('text', '')
+        cleaned_text = re.sub(r'^\d+\s*', '', text, count=1)
+        segment['text'] = cleaned_text
+        if segment['text'].strip():
+            final_segments.append(segment)
+
+    if not final_segments:
+        logger.warning(f"无有效内容解析: {filename}")
+    return final_segments
+
+def resample_audio_to_16k(audio_path, output_path, target_sr=16000):
+    """将音频重采样为 16kHz 单声道"""
+    try:
+        try:
+            audio = AudioSegment.from_file(audio_path)
+            if audio.frame_rate != target_sr:
+                audio = audio.set_frame_rate(target_sr)
+            if audio.channels > 1:
+                audio = audio.set_channels(1)
+            audio.export(output_path, format="wav")
+            logger.info(f"音频重采样成功: {output_path}")
+            return True
+        except Exception as e:
+            logger.warning(f"pydub 处理失败，尝试备用方案: {audio_path} - {str(e)}")
+            try:
+                data, sr = soundfile.read(audio_path)
+                if sr != target_sr:
+                    data = librosa.resample(data, orig_sr=sr, target_sr=target_sr)
+                soundfile.write(output_path, data, target_sr)
+                logger.info(f"音频重采样成功: {output_path}")
+                return True
+            except Exception as e:
+                logger.error(f"soundfile 处理失败: {audio_path} - {str(e)}")
+                return False
+    except Exception as e:
+        logger.error(f"音频处理异常: {audio_path} - {str(e)}")
+        return False
+
+def check_audio(audio_path, expected_sr=16000):
+    """检查音频采样率和时长"""
+    try:
+        samples, sr = soundfile.read(audio_path)
+        duration = round(len(samples) / sr, 2)
+        if sr != expected_sr:
+            logger.warning(f"音频采样率不匹配: {audio_path}, 期望 {expected_sr}, 实际 {sr}")
+            return None
+        logger.info(f"音频检查通过: {audio_path}, 时长 {duration}秒")
+        return duration
+    except Exception as e:
+        logger.error(f"读取音频失败: {audio_path} - {str(e)}")
+        return None
 
 def merge_segments_to_sentences(segments):
-    """将对话片段合并为完整的句子，计算结束时间"""
+    """将文本片段合并为句子，添加结束时间"""
     if not segments:
         return []
     
@@ -124,345 +280,422 @@ def merge_segments_to_sentences(segments):
     for i, segment in enumerate(segments):
         start_time = segment['start']
         text = segment['text']
+        speaker = segment.get('speaker', None)
+        end_time = segments[i+1]['start'] if i < len(segments)-1 else start_time + 3.0
         
-        # 计算结束时间
-        if i < len(segments) - 1:
-            # 使用下一个片段的开始时间作为当前片段的结束时间
-            end_time = segments[i + 1]['start']
-        else:
-            # 最后一个片段，假设持续3秒
-            end_time = start_time + 3.0
-        
-        sentences.append({
+        sentence = {
             'start': float(start_time),
             'end': float(end_time),
             'text': text
-        })
+        }
+        if speaker:
+            sentence['speaker'] = speaker
+        sentences.append(sentence)
     
     return sentences
 
-def split_audio_by_duration(audio_path, output_dir, max_duration=30.0):
-    """按时长切分音频文件"""
+def split_audio_by_sentences(audio_path, sentence_groups, output_dir):
+    """根据句子组切分音频"""
     try:
         audio = AudioSegment.from_wav(audio_path)
-        total_duration = len(audio) / 1000.0  # 转换为秒
+        base_name = os.path.splitext(os.path.basename(audio_path))[0]
+        segments = []
+        
+        for i, group in enumerate(sentence_groups):
+            if not group:
+                continue
+                
+            start_time = group[0]['start']
+            end_time = group[-1]['end']
+            
+            start_ms = int(start_time * 1000)
+            end_ms = int(end_time * 1000)
+            
+            end_ms = min(end_ms, len(audio))
+            
+            if end_ms <= start_ms:
+                continue
+                
+            segment = audio[start_ms:end_ms]
+            duration = (end_ms - start_ms) / 1000.0
+            
+            if duration < 0.5:
+                continue
+                
+            output_path = os.path.join(output_dir, f"{base_name}_sent_{i}.wav")
+            segment.export(output_path, format="wav")
+            segments.append((output_path, start_time, end_time, group))
+            logger.info(f"生成句子音频片段: {output_path}, {start_time}秒 - {end_time}秒")
+        
+        return segments
+    except Exception as e:
+        logger.error(f"句子切分音频失败: {audio_path} - {str(e)}")
+        return []
+
+def split_audio_by_duration(audio_path, output_dir, max_duration=30.0):
+    """按最大时长切分音频"""
+    try:
+        audio = AudioSegment.from_wav(audio_path)
+        total_duration = len(audio) / 1000.0
         
         if total_duration <= max_duration:
-            # 如果音频时长不超过最大时长，直接复制
-            base_name = os.path.splitext(os.path.basename(audio_path))[0]
-            output_path = os.path.join(output_dir, f"{base_name}_0.wav")
+            output_path = os.path.join(output_dir, f"{os.path.splitext(os.path.basename(audio_path))[0]}_0.wav")
             audio.export(output_path, format="wav")
+            logger.info(f"音频未切分: {output_path}, 时长 {total_duration}秒")
             return [(output_path, 0.0, total_duration)]
         
-        # 需要切分
         segments = []
-        base_name = os.path.splitext(os.path.basename(audio_path))[0]
         segment_length_ms = int(max_duration * 1000)
+        base_name = os.path.splitext(os.path.basename(audio_path))[0]
         
         for i in range(0, len(audio), segment_length_ms):
             segment = audio[i:i + segment_length_ms]
             start_time = i / 1000.0
             end_time = min((i + segment_length_ms) / 1000.0, total_duration)
-            
             output_path = os.path.join(output_dir, f"{base_name}_{int(start_time)}.wav")
             segment.export(output_path, format="wav")
             segments.append((output_path, start_time, end_time))
+            logger.info(f"生成音频片段: {output_path}, {start_time}秒 - {end_time}秒")
         
         return segments
     except Exception as e:
-        logger.error(f"切分音频 {audio_path} 失败: {str(e)}")
+        logger.error(f"切分音频失败: {audio_path} - {str(e)}")
         return []
 
 def validate_data_format(data_item):
-    """验证数据格式是否符合要求"""
-    try:
-        # 检查必需字段
-        required_fields = ["audio", "sentence", "language", "sentences", "duration"]
-        for field in required_fields:
-            if field not in data_item:
-                return False, f"缺少必需字段: {field}"
-        
-        # 检查audio字段
-        if "path" not in data_item["audio"]:
-            return False, "audio字段缺少path"
-        
-        # 检查sentence字段
-        if not isinstance(data_item["sentence"], str) or len(data_item["sentence"]) == 0:
-            return False, "sentence字段无效"
-        
-        # 检查language字段
-        if not isinstance(data_item["language"], str) or len(data_item["language"]) == 0:
-            return False, "language字段无效"
-        
-        # 检查sentences字段
-        if not isinstance(data_item["sentences"], list) or len(data_item["sentences"]) == 0:
-            return False, "sentences字段必须是非空列表"
-        
-        for sentence in data_item["sentences"]:
-            if not isinstance(sentence, dict):
-                return False, "sentences中的每个元素必须是字典"
-            
-            sentence_fields = ["start", "end", "text"]
-            for field in sentence_fields:
-                if field not in sentence:
-                    return False, f"sentences中缺少字段: {field}"
-            
-            # 检查时间戳
-            if not isinstance(sentence["start"], (int, float)) or not isinstance(sentence["end"], (int, float)):
-                return False, "start和end必须是数字"
-            
-            if sentence["start"] < 0 or sentence["end"] < 0 or sentence["start"] > sentence["end"]:
-                return False, "时间戳无效"
-            
-            # 检查文本
-            if not isinstance(sentence["text"], str) or len(sentence["text"]) == 0:
-                return False, "sentence文本无效"
-        
-        # 检查duration字段
-        if not isinstance(data_item["duration"], (int, float)) or data_item["duration"] <= 0:
-            return False, "duration字段无效"
-        
-        return True, "格式正确"
+    """验证数据项的格式"""
+    required_fields = ["audio", "sentence", "language", "sentences", "duration"]
+    for field in required_fields:
+        if field not in data_item:
+            return False, f"缺少字段: {field}"
     
-    except Exception as e:
-        return False, f"验证时发生错误: {str(e)}"
+    if not isinstance(data_item["sentence"], str) or not data_item["sentence"]:
+        return False, "无效句子"
+    
+    if not isinstance(data_item["sentences"], list) or not data_item["sentences"]:
+        return False, "无效句子列表"
+    
+    for sentence in data_item["sentences"]:
+        if not all(k in sentence for k in ["start", "end", "text"]):
+            return False, "句子缺少字段"
+        if sentence["start"] < 0 or sentence["end"] <= sentence["start"]:
+            return False, "无效时间戳"
+    
+    return True, "格式正确"
 
 def find_audio_text_dirs(target_dir):
-    """自动查找音频和文本目录"""
-    wav_dir = None
-    txt_dir = None
+    """查找音频和文本目录"""
+    possible_audio = ['WAV', 'wav', 'audio', 'Audio']
+    possible_text = ['TXT', 'txt', 'text', 'Text']
     
-    # 查找可能的目录名
-    possible_audio_names = ['WAV', 'wav', '语音', 'audio', 'Audio']
-    possible_text_names = ['TXT', 'txt', '文本', 'text', 'Text']
-    
-    def search_in_dir(base_dir):
-        """在指定目录中查找音频和文本目录"""
-        found_wav = None
-        found_txt = None
-        
+    def search_dir(base_dir):
+        wav, txt = None, None
         for item in os.listdir(base_dir):
-            item_path = os.path.join(base_dir, item)
-            if os.path.isdir(item_path):
-                if item in possible_audio_names:
-                    found_wav = item_path
-                elif item in possible_text_names:
-                    found_txt = item_path
-        
-        return found_wav, found_txt
+            path = os.path.join(base_dir, item)
+            if os.path.isdir(path):
+                if item in possible_audio:
+                    wav = path
+                elif item in possible_text:
+                    txt = path
+        return wav, txt
     
-    # 首先在target_dir直接查找
-    wav_dir, txt_dir = search_in_dir(target_dir)
+    wav_dir, txt_dir = search_dir(target_dir)
+    if not (wav_dir and txt_dir):
+        for item in os.listdir(target_dir):
+            path = os.path.join(target_dir, item)
+            if os.path.isdir(path):
+                sub_wav, sub_txt = search_dir(path)
+                if sub_wav and sub_txt:
+                    wav_dir, txt_dir = sub_wav, sub_txt
+                    break
     
     if wav_dir and txt_dir:
-        return wav_dir, txt_dir
-    
-    # 如果没找到，在子目录中查找
-    for item in os.listdir(target_dir):
-        item_path = os.path.join(target_dir, item)
-        if os.path.isdir(item_path):
-            sub_wav, sub_txt = search_in_dir(item_path)
-            if sub_wav and sub_txt:
-                wav_dir = sub_wav
-                txt_dir = sub_txt
-                logger.info(f"找到音频目录: {wav_dir}")
-                logger.info(f"找到文本目录: {txt_dir}")
-                break
+        logger.info(f"找到音频目录: {wav_dir}")
+        logger.info(f"找到文本目录: {txt_dir}")
+    else:
+        logger.error("未找到音频或文本目录")
     
     return wav_dir, txt_dir
 
-def main():
-    parser = argparse.ArgumentParser(description="处理对话音频和文本数据并生成JSON数据集")
-    parser.add_argument("--filepath", required=True, help="压缩包路径（.tar.gz或.zip）")
-    parser.add_argument("--target_dir", default="dataset", help="解压目录")
-    parser.add_argument("--train_json", default="dataset/train.json", help="训练集JSON文件名")
-    parser.add_argument("--test_json", default="dataset/test.json", help="测试集JSON文件名")
-    parser.add_argument("--language", default="Chinese", help="语言（默认：Chinese）")
-    parser.add_argument("--expected_sr", type=int, default=16000, help="预期采样率（默认：16000）")
-    parser.add_argument("--max_duration", type=float, default=30.0, help="最大音频片段时长（秒，默认：30）")
-    args = parser.parse_args()
-
-    if not os.path.exists(args.filepath):
-        raise FileNotFoundError(f"文件不存在: {args.filepath}")
-
-    os.makedirs(args.target_dir, exist_ok=True)
-    unpack(args.filepath, args.target_dir)
-
-    # 自动检测解压后的目录结构
-    wav_dir, txt_dir = find_audio_text_dirs(args.target_dir)
-    
-    if wav_dir is None or txt_dir is None:
-        logger.error("解压后的目录结构不符合预期")
-        logger.error("当前目录结构:")
-        for root, dirs, files in os.walk(args.target_dir):
-            level = root.replace(args.target_dir, '').count(os.sep)
-            indent = ' ' * 2 * level
-            logger.error(f"{indent}{os.path.basename(root)}/")
-            subindent = ' ' * 2 * (level + 1)
-            for f in files[:5]:  # 只显示前5个文件
-                logger.error(f"{subindent}{f}")
-            if len(files) > 5:
-                logger.error(f"{subindent}... 还有 {len(files) - 5} 个文件")
-        raise FileNotFoundError("未找到音频或文本目录")
-
-    # 创建处理后的音频目录
-    processed_audio_dir = os.path.join(args.target_dir, "processed_audio")
-    segment_dir = os.path.join(args.target_dir, "audio_segments")
-    os.makedirs(processed_audio_dir, exist_ok=True)
-    os.makedirs(segment_dir, exist_ok=True)
-
-    logger.info("正在生成数据集...")
-    dataset = []
-    
-    # 支持多种音频格式
-    audio_extensions = ['.wav', '.mp3', '.m4a', '.flac', '.ogg']
-    audio_files = []
-    for ext in audio_extensions:
-        audio_files.extend([f for f in os.listdir(wav_dir) if f.lower().endswith(ext)])
-    
-    logger.info(f"找到 {len(audio_files)} 个音频文件")
-
-    for audio_file in tqdm(audio_files, desc="处理音频文件"):
-        # 根据音频文件名查找对应的文本文件
-        base_name = os.path.splitext(audio_file)[0]
-        txt_file = base_name + ".txt"
-        txt_path = os.path.join(txt_dir, txt_file)
-
-        if not os.path.exists(txt_path):
-            logger.warning(f"未找到对应的文本文件: {txt_path}")
-            continue
-
-        # 首先统一处理音频采样率
-        original_audio_path = os.path.join(wav_dir, audio_file)
-        processed_audio_path = os.path.join(processed_audio_dir, base_name + ".wav")
+def process_and_save_dataset(args):
+    """核心处理逻辑，处理音频和文本，生成并保存JSON数据集"""
+    try:
+        # 获取文件名（不带扩展名），作为子目录名称
+        zip_base_name = Path(args.input_path).stem
+        target_sub_dir = os.path.join(args.target_dir, zip_base_name)
         
-        if not resample_audio_to_16k(original_audio_path, processed_audio_path, args.expected_sr):
-            logger.warning(f"音频重采样失败，跳过: {audio_file}")
-            continue
+        # 检查子目录是否已存在，如果存在则跳过解压
+        if os.path.exists(target_sub_dir):
+            logger.info(f"目录 {target_sub_dir} 已存在，跳过解压。")
+        else:
+            unpack(args.input_path, target_sub_dir)
 
-        # 检查处理后的音频
-        total_duration = check_audio(processed_audio_path, args.expected_sr)
-        if total_duration is None:
-            logger.warning(f"音频检查失败，跳过: {processed_audio_path}")
-            continue
+        wav_dir, txt_dir = find_audio_text_dirs(target_sub_dir)
+        if not wav_dir or not txt_dir:
+            raise FileNotFoundError(f"未在 {target_sub_dir} 中找到音频或文本目录")
 
-        try:
-            # 读取并解析文本文件
-            with open(txt_path, "r", encoding="utf-8") as f:
-                content = f.read()
-            
-            # 解析对话转录内容
-            segments = parse_transcript_content(content)
-            if not segments:
-                logger.warning(f"文本文件 {txt_path} 没有有效的对话内容")
-                continue
-            
-            # 合并为完整的句子
-            sentences = merge_segments_to_sentences(segments)
-            if not sentences:
-                logger.warning(f"文本文件 {txt_path} 无法生成有效的句子")
-                continue
-            
-            # 生成完整的句子文本
-            full_text = " ".join(s["text"] for s in sentences)
-            full_text = preprocess_text(full_text)
-            
-            if len(full_text) < 1 or len(full_text) > 20000:
-                logger.warning(f"文本 {txt_path} 长度 {len(full_text)} 超出范围 [1, 20000]")
-                continue
-                
-        except Exception as e:
-            logger.error(f"处理文本文件 {txt_path} 失败: {str(e)}")
-            continue
+        processed_audio_dir = os.path.join(target_sub_dir, "processed_audio")
+        segment_dir = os.path.join(target_sub_dir, "audio_segments")
+        os.makedirs(processed_audio_dir, exist_ok=True)
+        os.makedirs(segment_dir, exist_ok=True)
 
-        # 按时长切分音频
-        audio_segments = split_audio_by_duration(processed_audio_path, segment_dir, args.max_duration)
+        dataset = []
+        audio_extensions = ['.wav', '.mp3', '.m4a', '.flac', '.ogg', '.WAV', '.MP3']
+        audio_files = [f for f in os.listdir(wav_dir) 
+                      if os.path.splitext(f)[1].lower() in audio_extensions]
         
-        for seg_path, seg_start, seg_end in audio_segments:
-            seg_duration = round(seg_end - seg_start, 2)
-            if seg_duration < 0.5:
-                logger.warning(f"音频片段 {seg_path} 时长 {seg_duration} 过短，跳过")
+        logger.info(f"找到 {len(audio_files)} 个音频文件")
+        logger.info(f"切分方法: {args.split_method}")
+
+        for audio_file in tqdm(audio_files, desc="处理进度"):
+            base_name = os.path.splitext(audio_file)[0]
+            txt_file = base_name + ".txt"
+            txt_path = os.path.join(txt_dir, txt_file)
+
+            if not os.path.exists(txt_path):
+                logger.warning(f"未找到文本文件: {txt_path}")
                 continue
+
+            audio_path = os.path.join(wav_dir, audio_file)
+            processed_path = os.path.join(processed_audio_dir, f"{base_name}.wav")
             
-            # 找到该音频片段时间范围内的句子
-            seg_sentences = []
-            for sentence in sentences:
-                s_start = sentence["start"]
-                s_end = sentence["end"]
+            if not resample_audio_to_16k(audio_path, processed_path, args.expected_sr):
+                logger.warning(f"音频处理失败，跳过: {audio_file}")
+                continue
+
+            duration = check_audio(processed_path, args.expected_sr)
+            if not duration:
+                logger.warning(f"音频检查失败，跳过: {audio_file}")
+                continue
+
+            try:
+                with open(txt_path, "r", encoding="utf-8") as f:
+                    content = f.read()
                 
-                # 检查句子是否与音频片段有重叠
-                if s_start < seg_end and s_end > seg_start:
-                    # 调整句子的时间戳相对于音频片段开始时间
-                    adjusted_start = max(0, s_start - seg_start)
-                    adjusted_end = min(seg_duration, s_end - seg_start)
+                segments = parse_transcript_content(content, base_name)
+                if not segments:
+                    logger.warning(f"无有效内容: {txt_path}")
+                    continue
+                
+                sentences = merge_segments_to_sentences(segments)
+                if not sentences:
+                    logger.warning(f"无法生成句子: {txt_path}")
+                    continue
+                
+                full_text = " ".join(s["text"] for s in sentences)
+                if not (1 <= len(full_text) <= 20000):
+                    logger.warning(f"文本长度异常: {txt_path}, 长度 {len(full_text)}")
+                    continue
                     
-                    # 确保调整后的时间戳有效
-                    if adjusted_end > adjusted_start:
+            except Exception as e:
+                logger.error(f"处理文本失败: {txt_path} - {str(e)}")
+                continue
+
+            if args.split_method == 'sentence':
+                sentence_groups = split_sentences_by_length(
+                    sentences, args.max_sentence_length, args.length_method)
+                audio_segments = split_audio_by_sentences(processed_path, sentence_groups, segment_dir)
+                
+                for seg_path, seg_start, seg_end, group in audio_segments:
+                    seg_duration = seg_end - seg_start
+                    seg_sentences = []
+                    
+                    for s in group:
+                        adjusted_start = max(0, s["start"] - seg_start)
+                        adjusted_end = min(seg_duration, s["end"] - seg_start)
                         seg_sentences.append({
                             "start": round(adjusted_start, 2),
                             "end": round(adjusted_end, 2),
-                            "text": sentence["text"]
+                            "text": s["text"],
+                            "speaker": s.get("speaker", None)
                         })
-            
-            if not seg_sentences:
-                logger.warning(f"音频片段 {seg_path} 没有匹配的句子，跳过")
-                continue
-            
-            # 生成该片段的完整文本
-            seg_full_text = " ".join(s["text"] for s in seg_sentences)
-            seg_full_text = preprocess_text(seg_full_text)
-            
-            if len(seg_full_text) < 1 or len(seg_full_text) > 20000:
-                logger.warning(f"音频片段 {seg_path} 句子长度 {len(seg_full_text)} 超出范围 [1, 20000]")
-                continue
-            
-            # 创建数据项
-            data_item = {
-                "audio": {"path": seg_path},
-                "sentence": seg_full_text,
-                "language": args.language,
-                "sentences": seg_sentences,
-                "duration": seg_duration
-            }
-            
-            # 验证数据格式
-            is_valid, error_msg = validate_data_format(data_item)
-            if not is_valid:
-                logger.warning(f"数据格式验证失败: {seg_path} - {error_msg}")
-                continue
-            
-            dataset.append(data_item)
+                    
+                    seg_text = " ".join(s["text"] for s in seg_sentences)
+                    data_item = {
+                        "audio": {"path": seg_path},
+                        "sentence": seg_text,
+                        "language": args.language,
+                        "sentences": seg_sentences,
+                        "duration": round(seg_duration, 2)
+                    }
+                    
+                    is_valid, msg = validate_data_format(data_item)
+                    if is_valid:
+                        dataset.append(data_item)
+                        logger.debug(f"添加句子切分数据项: {seg_path}")
+                    else:
+                        logger.warning(f"数据格式验证失败: {seg_path} - {msg}")
+                        
+            elif args.split_method == 'duration':
+                audio_segments = split_audio_by_duration(processed_path, segment_dir, args.max_duration)
+                
+                for seg_path, seg_start, seg_end in audio_segments:
+                    seg_duration = seg_end - seg_start
+                    if seg_duration < 0.5:
+                        logger.debug(f"跳过过短片段: {seg_path}, 时长 {seg_duration}秒")
+                        continue
+                    
+                    seg_sentences = []
+                    for s in sentences:
+                        if s["start"] < seg_end and s["end"] > seg_start:
+                            adjusted_start = max(0, s["start"] - seg_start)
+                            adjusted_end = min(seg_duration, s["end"] - seg_start)
+                            if adjusted_end > adjusted_start:
+                                seg_sentences.append({
+                                    "start": round(adjusted_start, 2),
+                                    "end": round(adjusted_end, 2),
+                                    "text": s["text"],
+                                    "speaker": s.get("speaker", None)
+                                })
+                    
+                    if not seg_sentences:
+                        logger.debug(f"无匹配句子: {seg_path}")
+                        continue
+                    
+                    seg_text = " ".join(s["text"] for s in seg_sentences)
+                    data_item = {
+                        "audio": {"path": seg_path},
+                        "sentence": seg_text,
+                        "language": args.language,
+                        "sentences": seg_sentences,
+                        "duration": round(seg_duration, 2)
+                    }
+                    
+                    is_valid, msg = validate_data_format(data_item)
+                    if is_valid:
+                        dataset.append(data_item)
+                        logger.debug(f"添加时长切分数据项: {seg_path}")
+                    else:
+                        logger.warning(f"数据格式验证失败: {seg_path} - {msg}")
+                        
+            elif args.split_method == 'both':
+                sentence_groups = split_sentences_by_length(
+                    sentences, args.max_sentence_length, args.length_method)
+                
+                for group in sentence_groups:
+                    if not group:
+                        continue
+                        
+                    group_start = group[0]['start']
+                    group_end = group[-1]['end']
+                    group_duration = group_end - group_start
+                    
+                    if group_duration > args.max_duration:
+                        temp_audio = AudioSegment.from_wav(processed_path)[
+                            int(group_start * 1000):int(group_end * 1000)]
+                        temp_path = os.path.join(segment_dir, f"{base_name}_temp.wav")
+                        temp_audio.export(temp_path, format="wav")
+                        
+                        time_segments = split_audio_by_duration(temp_path, segment_dir, args.max_duration)
+                        os.remove(temp_path)
+                        
+                        for seg_path, rel_start, rel_end in time_segments:
+                            abs_start = group_start + rel_start
+                            abs_end = group_start + rel_end
+                            
+                            seg_sentences = []
+                            for s in group:
+                                if s["start"] < abs_end and s["end"] > abs_start:
+                                    adjusted_start = max(0, s["start"] - abs_start)
+                                    adjusted_end = min(rel_end - rel_start, s["end"] - abs_start)
+                                    if adjusted_end > adjusted_start:
+                                        seg_sentences.append({
+                                            "start": round(adjusted_start, 2),
+                                            "end": round(adjusted_end, 2),
+                                            "text": s["text"],
+                                            "speaker": s.get("speaker", None)
+                                        })
+                            
+                            if seg_sentences:
+                                seg_text = " ".join(s["text"] for s in seg_sentences)
+                                data_item = {
+                                    "audio": {"path": seg_path},
+                                    "sentence": seg_text,
+                                    "language": args.language,
+                                    "sentences": seg_sentences,
+                                    "duration": round(rel_end - rel_start, 2)
+                                }
+                                
+                                is_valid, msg = validate_data_format(data_item)
+                                if is_valid:
+                                    dataset.append(data_item)
+                                    logger.debug(f"添加混合切分数据项: {seg_path}")
+                                else:
+                                    logger.warning(f"数据格式验证失败: {seg_path} - {msg}")
+                    else:
+                        seg_path = os.path.join(segment_dir, f"{base_name}_sent_group_{len(dataset)}.wav")
+                        group_audio = AudioSegment.from_wav(processed_path)[
+                            int(group_start * 1000):int(group_end * 1000)]
+                        group_audio.export(seg_path, format="wav")
+                        
+                        seg_sentences = []
+                        for s in group:
+                            adjusted_start = max(0, s["start"] - group_start)
+                            adjusted_end = min(group_duration, s["end"] - group_start)
+                            seg_sentences.append({
+                                "start": round(adjusted_start, 2),
+                                "end": round(adjusted_end, 2),
+                                "text": s["text"],
+                                "speaker": s.get("speaker", None)
+                            })
+                        
+                        seg_text = " ".join(s["text"] for s in seg_sentences)
+                        data_item = {
+                            "audio": {"path": seg_path},
+                            "sentence": seg_text,
+                            "language": args.language,
+                            "sentences": seg_sentences,
+                            "duration": round(group_duration, 2)
+                        }
+                        
+                        is_valid, msg = validate_data_format(data_item)
+                        if is_valid:
+                            dataset.append(data_item)
+                            logger.debug(f"添加句子组数据项: {seg_path}")
+                        else:
+                            logger.warning(f"数据格式验证失败: {seg_path} - {msg}")
 
-    logger.info(f"成功处理 {len(dataset)} 个音频片段")
-    
-    if len(dataset) == 0:
-        logger.error("没有生成任何有效的数据项，请检查输入文件格式")
-        return
-    
-    # 打乱数据集
-    random.shuffle(dataset)
-    split_index = int(len(dataset) * 0.9)
-    train_dataset = dataset[:split_index]
-    test_dataset = dataset[split_index:]
+        if not dataset:
+            raise ValueError("未生成有效数据")
+        
+        # 保存所有处理好的数据到一个文件
+        os.makedirs(os.path.dirname(args.output_json), exist_ok=True)
+        with open(args.output_json, "w", encoding="utf-8") as f:
+            for item in dataset:
+                json.dump(item, f, ensure_ascii=False)
+                f.write("\n")
+        logger.info(f"已保存 {len(dataset)} 条数据到 {args.output_json}")
+            
+        logger.info(f"总数据条数: {len(dataset)}")
+        if dataset:
+            durations = [item['duration'] for item in dataset]
+            lengths = [len(item['sentence']) for item in dataset]
+            logger.info(f"音频时长统计: 最短 {min(durations):.2f}秒, 最长 {max(durations):.2f}秒, 平均 {sum(durations)/len(durations):.2f}秒")
+            logger.info(f"文本长度统计: 最短 {min(lengths)}字符, 最长 {max(lengths)}字符, 平均 {sum(lengths)/len(lengths):.1f}字符")
+            
+            logger.info("数据示例:")
+            print(json.dumps(dataset[0], ensure_ascii=False, indent=2))
 
-    # 保存训练集
-    with open(args.train_json, "w", encoding="utf-8") as f:
-        for item in train_dataset:
-            json.dump(item, f, ensure_ascii=False)
-            f.write("\n")
-    logger.info(f"训练集已生成（JSON Lines 格式） -> {args.train_json}, 共 {len(train_dataset)} 个样本")
+    except Exception as e:
+        logger.error(f"主程序异常: {str(e)}")
+        raise
 
-    # 保存测试集
-    with open(args.test_json, "w", encoding="utf-8") as f:
-        for item in test_dataset:
-            json.dump(item, f, ensure_ascii=False)
-            f.write("\n")
-    logger.info(f"测试集已生成（JSON Lines 格式） -> {args.test_json}, 共 {len(test_dataset)} 个样本")
+def main():
+    """主函数：处理音频和文本，生成 JSON 数据集"""
+    parser = argparse.ArgumentParser(description="处理音频和文本数据生成JSON数据集")
+    parser.add_argument("--input_path", required=True, help="输入的压缩包路径（支持 .tar.gz 或 .zip）")
+    parser.add_argument("--output_json", required=True, help="输出JSON文件路径")
+    parser.add_argument("--target_dir", default="dataset", help="解压目录，默认是./dataset")
+    parser.add_argument("--language", default="Cantonese", help="语言标签（如 zh, en）") #Cantonese
+    parser.add_argument("--expected_sr", type=int, default=16000, help="目标采样率")
+    parser.add_argument("--max_duration", type=float, default=30.0, help="最大音频时长（秒）")
+    parser.add_argument("--min_duration", type=float, default=0.5, help="最小音频时长（秒）")
+    parser.add_argument("--split_method", choices=['duration', 'sentence', 'both'], default='duration', help="切分方法：duration按时长，sentence按句子，both两种都用")
+    parser.add_argument("--max_sentence_length", type=int, default=200, help="最大句子长度")
+    parser.add_argument("--length_method", choices=['char', 'word', 'token'], default='char', help="长度计算方法：char字符，word词，token令牌")
+    args = parser.parse_args()
 
-    # 输出格式示例
-    if len(dataset) > 0:
-        logger.info("数据格式示例:")
-        print(json.dumps(dataset[0], ensure_ascii=False, indent=2))
+    process_and_save_dataset(args)
 
 if __name__ == "__main__":
     main()
