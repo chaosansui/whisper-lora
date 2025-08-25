@@ -11,6 +11,8 @@ import argparse
 import librosa
 import shutil
 from pathlib import Path
+from datasets import load_dataset
+from huggingface_hub import list_repo_files
 
 # 设置日志
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -417,6 +419,25 @@ def find_audio_text_dirs(target_dir):
     
     return wav_dir, txt_dir
 
+# 新增的函数
+def load_huggingface_dataset(dataset_name, subset=None, split="train", **kwargs):
+    """从 Hugging Face Hub 加载一个数据集"""
+    logger.info(f"尝试从 Hugging Face Hub 加载数据集: {dataset_name} ({subset or ''})")
+    try:
+        # 使用流式加载以节省内存，对于大型数据集特别有用
+        dataset = load_dataset(
+            dataset_name,
+            subset,
+            split=split,
+            streaming=False,
+            **kwargs
+        )
+        logger.info(f"成功加载 Hugging Face 数据集。数据条数: {len(dataset)}")
+        return dataset
+    except Exception as e:
+        logger.error(f"加载 Hugging Face 数据集失败: {str(e)}")
+        return None
+
 def process_and_save_dataset(args):
     """核心处理逻辑，处理音频和文本，生成并保存JSON数据集"""
     try:
@@ -680,22 +701,199 @@ def process_and_save_dataset(args):
         logger.error(f"主程序异常: {str(e)}")
         raise
 
+def preprocess_text(text: str) -> str:
+    """
+    对文本进行基本的预处理。
+    """
+    filtered_text = text.replace("like/subscribe to YouTube channel", "").replace("subtitles by [xxxx]", "")
+    return " ".join(filtered_text.split()).strip()
+
+def validate_data_format(item: dict) -> tuple[bool, str]:
+    """
+    验证数据项是否符合目标格式。
+    """
+    required_keys = ["audio", "sentence", "language", "sentences", "duration"]
+    if not all(key in item for key in required_keys):
+        return False, f"缺少必需的键: {required_keys}"
+    
+    if not isinstance(item["audio"], dict) or "path" not in item["audio"]:
+        return False, "audio 键必须是一个包含 path 的字典"
+    
+    if not isinstance(item["sentences"], list) or not all(isinstance(s, dict) for s in item["sentences"]):
+        return False, "sentences 键必须是一个字典列表"
+        
+    return True, "格式正确"
+
+def process_huggingface_dataset(args: argparse.Namespace):
+    """
+    加载并处理 Hugging Face 数据集，将其转换为目标 JSONL 格式。
+    该函数通过手动控制文件列表来智能跳过损坏的分片。
+    """
+    logger.info("开始处理 Hugging Face 数据集...")
+    
+    # 2. 创建输出目录和文件路径
+    hf_output_dir = os.path.join(args.target_dir, "huggingface_processed")
+    os.makedirs(hf_output_dir, exist_ok=True)
+    
+    audio_output_dir = os.path.join(hf_output_dir, "audio")
+    os.makedirs(audio_output_dir, exist_ok=True)
+    
+    output_jsonl_path = os.path.join(hf_output_dir, "hf_data.jsonl")
+
+    # 1. 检查已处理的记录，实现断点续传
+    processed_ids = set()
+    if os.path.exists(output_jsonl_path):
+        logger.info("检测到已存在的 JSONL 文件，正在加载已处理的记录...")
+        try:
+            with open(output_jsonl_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    try:
+                        data = json.loads(line)
+                        audio_path = data['audio']['path']
+                        audio_id = Path(audio_path).stem
+                        processed_ids.add(audio_id)
+                    except json.JSONDecodeError:
+                        logger.warning(f"跳过 JSON 解码错误的行: {line.strip()}")
+        except Exception as e:
+            logger.error(f"加载已处理记录失败: {e}。将从头开始处理。")
+            processed_ids.clear()
+    
+    logger.info(f"已加载 {len(processed_ids)} 条已处理的记录。")
+
+    # 3. 获取数据集的所有分片文件列表
+    logger.info("正在获取数据集的所有分片文件列表...")
+    data_files = []
+    try:
+        # 使用 huggingface_hub 来获取所有分片文件
+        repo_files = list_repo_files(args.hf_dataset_name, repo_type="dataset", token=os.environ.get("HF_TOKEN"))
+        data_files = [f"hf://datasets/{args.hf_dataset_name}/train/{file_name}" for file_name in repo_files if file_name.startswith("train-") and file_name.endswith(".parquet")]
+        logger.info(f"成功找到 {len(data_files)} 个分片文件。")
+    except Exception as e:
+        logger.error(f"无法获取数据集分片列表: {e}")
+        return
+
+    processed_count_this_run = 0
+    with open(output_jsonl_path, "a", encoding="utf-8") as f:
+        # 4. 遍历每个分片文件
+        for file_path in data_files:
+            try:
+                # 尝试加载整个分片到内存
+                logger.info(f"正在处理分片: {file_path}")
+                
+                # 创建一个 Parquet 文件读取器，它只包含 `audio` 和 `transcript_whisper` 列
+                table = pq.read_table(
+                    file_path, 
+                    columns=['audio', 'transcript_whisper']
+                )
+                
+                # 将 Parquet 表转换为可迭代的 Python 字典列表
+                batch_data = table.to_pydict()
+                
+                # 遍历分片中的每一条记录
+                for i in range(len(batch_data['audio'])):
+                    item = {
+                        'audio': batch_data['audio'][i],
+                        'transcript_whisper': batch_data['transcript_whisper'][i],
+                        # 确保其他可能需要的字段存在
+                        'id': batch_data.get('id', [None]*len(batch_data['audio']))[i],
+                    }
+
+                    # 检查此项是否已处理过
+                    item_id = item.get('id', 'unknown_id')
+                    if item_id in processed_ids:
+                        continue
+                    
+                    # === 核心过滤逻辑 ===
+                    if not item['audio'] or not item['transcript_whisper']:
+                        logger.warning(f"跳过缺少 'audio' 或 'transcript_whisper' 字段的数据项: {item_id}")
+                        continue
+                    
+                    try:
+                        # 文本预处理
+                        transcript = item.get('transcript_whisper')
+                        cleaned_text = preprocess_text(transcript)
+                        if not cleaned_text.strip():
+                            continue
+
+                        # 音频重采样并保存到本地
+                        audio_data = item.get('audio')
+                        audio_array = audio_data['array']
+                        sampling_rate = audio_data['sampling_rate']
+                        
+                        audio_filename = f"{item_id}.wav"
+                        audio_path = os.path.join(audio_output_dir, audio_filename)
+                        
+                        if sampling_rate != args.expected_sr:
+                            audio_array = librosa.resample(audio_array, orig_sr=sampling_rate, target_sr=args.expected_sr)
+                        
+                        soundfile.write(audio_path, audio_array, args.expected_sr)
+                        
+                        # 格式化为 JSONL
+                        duration = round(len(audio_array) / args.expected_sr, 2)
+                        
+                        processed_item = {
+                            "audio": {"path": audio_path},
+                            "sentence": cleaned_text,
+                            "language": args.language,
+                            "sentences": [
+                                {
+                                    "start": 0.0,
+                                    "end": duration,
+                                    "text": cleaned_text,
+                                    "speaker": None
+                                }
+                            ],
+                            "duration": duration
+                        }
+
+                        # 验证并写入文件
+                        is_valid, msg = validate_data_format(processed_item)
+                        if is_valid:
+                            json.dump(processed_item, f, ensure_ascii=False)
+                            f.write("\n")
+                            processed_count_this_run += 1
+                            if processed_count_this_run % 1000 == 0:
+                                logger.info(f"本次运行已成功处理 {processed_count_this_run} 条新记录。")
+                        else:
+                            logger.warning(f"Hugging Face 数据项格式验证失败: {msg}")
+
+                    except Exception as e:
+                        # 这个块处理在处理单个数据项时发生的错误。
+                        logger.error(f"处理 Hugging Face 数据项失败: {item.get('id', 'unknown')} - 错误: {e}")
+                        
+            except Exception as e:
+                # 捕获在加载整个分片时发生的任何错误，并跳过该分片
+                logger.error(f"无法加载分片 {file_path}。跳过该分片。错误: {e}")
+                
+    logger.info(f"本次运行成功处理 {processed_count_this_run} 条 Hugging Face 数据到 {output_jsonl_path}")
+    logger.info(f"Hugging Face 数据处理完成，文件位于: {hf_output_dir}")
+
 def main():
-    """主函数：处理音频和文本，生成 JSON 数据集"""
+
     parser = argparse.ArgumentParser(description="处理音频和文本数据生成JSON数据集")
-    parser.add_argument("--input_path", required=True, help="输入的压缩包路径（支持 .tar.gz 或 .zip）")
-    parser.add_argument("--output_json", required=True, help="输出JSON文件路径")
+    parser.add_argument("--input_path", type=str, default=None, help="输入的本地压缩包路径（可选）")
+    parser.add_argument("--output_json", required=True, help="输出本地JSON文件路径")
     parser.add_argument("--target_dir", default="dataset", help="解压目录，默认是./dataset")
-    parser.add_argument("--language", default="Cantonese", help="语言标签（如 zh, en）") #Cantonese
+    parser.add_argument("--language", default="Cantonese", help="语言标签")
     parser.add_argument("--expected_sr", type=int, default=16000, help="目标采样率")
     parser.add_argument("--max_duration", type=float, default=30.0, help="最大音频时长（秒）")
     parser.add_argument("--min_duration", type=float, default=0.5, help="最小音频时长（秒）")
-    parser.add_argument("--split_method", choices=['duration', 'sentence', 'both'], default='duration', help="切分方法：duration按时长，sentence按句子，both两种都用")
-    parser.add_argument("--max_sentence_length", type=int, default=200, help="最大句子长度")
-    parser.add_argument("--length_method", choices=['char', 'word', 'token'], default='char', help="长度计算方法：char字符，word词，token令牌")
+    parser.add_argument("--split_method", choices=['duration', 'sentence', 'both'], default='duration', help="切分方法")
+    parser.add_argument("--max_sentence_length", type=int, default=1200, help="最大句子长度")
+    parser.add_argument("--length_method", choices=['char', 'word', 'token'], default='char', help="长度计算方法")
+    
+    parser.add_argument("--hf_dataset_name", type=str, default="alvanlii/cantonese-youtube", help="Hugging Face 数据集名称，如果使用则指定")
+    parser.add_argument("--hf_subset", type=str, default=None, help="Hugging Face 数据集的子集名称")
+
     args = parser.parse_args()
 
-    process_and_save_dataset(args)
-
+    if args.input_path:
+        process_and_save_dataset(args)
+    else:
+        logger.info("未提供本地输入路径，跳过本地数据处理。")
+    
+    if args.hf_dataset_name:
+        process_huggingface_dataset(args)
+        
 if __name__ == "__main__":
     main()
