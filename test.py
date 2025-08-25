@@ -4,7 +4,7 @@ from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 import argparse
 import time
 import numpy as np
-from pydub import AudioSegment  # 需要安装 pydub
+from pydub import AudioSegment
 
 def parse_args():
     parser = argparse.ArgumentParser(description="测试语音识别模型（支持长音频）")
@@ -12,9 +12,10 @@ def parse_args():
     parser.add_argument("--audio_path", type=str, required=True, help="要测试的音频文件路径")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", 
                        help="运行设备 (cuda/cpu)")
-    parser.add_argument("--language", type=str, default="zh", help="语音语言代码 (如zh/en)")
+    parser.add_argument("--language", type=str, default="Cantonese", help="语音语言代码 (如zh/en)")
     parser.add_argument("--chunk_length", type=int, default=30, help="分段长度（秒）")
     parser.add_argument("--overlap", type=int, default=2, help="分段重叠长度（秒）")
+    parser.add_argument("--max_new_tokens", type=int, default=256, help="最大生成 token 数")
     return parser.parse_args()
 
 def load_model(model_path, device):
@@ -22,24 +23,23 @@ def load_model(model_path, device):
     start_time = time.time()
     model = AutoModelForSpeechSeq2Seq.from_pretrained(model_path).to(device)
     processor = AutoProcessor.from_pretrained(model_path)
+    
+    # 清除冲突的生成配置
+    model.generation_config.forced_decoder_ids = None
+    
     print(f"模型加载完成，耗时 {time.time()-start_time:.2f}秒")
     return model, processor
 
 def load_long_audio(audio_path, target_sr=16000):
     print(f"正在加载长音频文件 {audio_path}...")
-    
-    # 使用pydub处理各种格式的音频
     audio = AudioSegment.from_file(audio_path)
     audio = audio.set_frame_rate(target_sr).set_channels(1)
     duration_sec = len(audio) / 1000
     print(f"音频总时长: {duration_sec:.2f}秒")
-    
-    # 转换为numpy数组
     samples = np.array(audio.get_array_of_samples())
     return samples, target_sr, duration_sec
 
 def split_audio(audio_array, sample_rate, chunk_length=30, overlap=2):
-    """将长音频分割成带重叠的片段"""
     chunk_size = chunk_length * sample_rate
     overlap_size = overlap * sample_rate
     stride = chunk_size - overlap_size
@@ -55,8 +55,11 @@ def split_audio(audio_array, sample_rate, chunk_length=30, overlap=2):
     print(f"分割为 {len(chunks)} 个片段，每段 {chunk_length}秒 (重叠 {overlap}秒)")
     return chunks
 
-def transcribe_long_audio(model, processor, audio_chunks, sample_rate, device, language="zh"):
+def transcribe_long_audio(model, processor, audio_chunks, sample_rate, device, language="zh", max_new_tokens=256):
     full_transcript = []
+    
+    # 获取语言 & 任务的 forced_decoder_ids
+    forced_decoder_ids = processor.get_decoder_prompt_ids(language=language, task="transcribe")
     
     for i, chunk in enumerate(audio_chunks, 1):
         print(f"\n处理片段 {i}/{len(audio_chunks)}...")
@@ -69,10 +72,18 @@ def transcribe_long_audio(model, processor, audio_chunks, sample_rate, device, l
         ).to(device)
         
         with torch.no_grad():
-            outputs = model.generate(**inputs, language=language)
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                no_repeat_ngram_size=5,  # 避免重复
+                temperature=0.2,  # 降低随机性
+                num_beams=1,  # 贪婪搜索
+                eos_token_id=processor.tokenizer.eos_token_id,
+                forced_decoder_ids=forced_decoder_ids
+            )
         
         transcript = processor.batch_decode(outputs, skip_special_tokens=True)[0]
-        full_transcript.append(transcript)
+        full_transcript.append(transcript.strip())
         
         print(f"片段 {i} 识别完成，耗时 {time.time()-start_time:.2f}秒")
         print(f"当前结果: {transcript}")
@@ -85,7 +96,7 @@ if __name__ == "__main__":
     # 加载模型
     model, processor = load_model(args.model_path, args.device)
     
-    # 加载音频（支持长音频）
+    # 加载音频
     audio_array, sample_rate, duration = load_long_audio(args.audio_path)
     
     # 分割音频
@@ -103,7 +114,8 @@ if __name__ == "__main__":
         audio_chunks=audio_chunks,
         sample_rate=sample_rate,
         device=args.device,
-        language=args.language
+        language=args.language,
+        max_new_tokens=args.max_new_tokens
     )
     
     # 打印结果

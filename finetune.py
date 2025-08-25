@@ -14,14 +14,14 @@ from utils.utils import print_arguments, make_inputs_require_grad, add_arguments
 
 parser = argparse.ArgumentParser(description=__doc__)
 add_arg = functools.partial(add_arguments, argparser=parser)
-add_arg("train_data",    type=str, default="dataset/train.json",       help="训练数据集的路径")
+add_arg("train_data",    type=str, default="dataset/huggingface_processed/hf_data.jsonl",       help="训练数据集的路径")
 add_arg("test_data",     type=str, default="dataset/test.json",        help="测试数据集的路径")
 add_arg("base_model",    type=str, default="/home/jinhui/data/internvl_deploy/models/whisper-large-v3",      help="Whisper的基础模型")
 add_arg("output_dir",    type=str, default="output/",                  help="训练保存模型的路径")
-add_arg("warmup_steps",  type=int, default=50,      help="训练预热步数")
-add_arg("logging_steps", type=int, default=50,     help="打印日志步数")
-add_arg("eval_steps",    type=int, default=50,    help="多少步数评估一次")
-add_arg("save_steps",    type=int, default=500,    help="多少步数保存模型一次")
+add_arg("warmup_steps",  type=int, default=1500,      help="训练预热步数")
+add_arg("logging_steps", type=int, default=10,     help="打印日志步数")
+add_arg("eval_steps",    type=int, default=500,    help="多少步数评估一次")
+add_arg("save_steps",    type=int, default=1000,    help="多少步数保存模型一次")
 add_arg("num_workers",   type=int, default=8,       help="读取数据的线程数量")
 add_arg("learning_rate", type=float, default=5e-5,  help="学习率大小")
 add_arg("min_audio_len", type=float, default=0.5,   help="最小的音频长度，单位秒")
@@ -32,14 +32,14 @@ add_arg("use_8bit",      type=bool,  default=False, help="是否将模型量化�
 add_arg("timestamps",    type=bool,  default=False, help="训练时是否使用时间戳数据")
 add_arg("use_compile",   type=bool, default=False, help="是否使用Pytorch2.0的编译器")
 add_arg("local_files_only", type=bool, default=False, help="是否只在本地加载模型，不尝试下载")
-add_arg("num_train_epochs", type=int, default=100,      help="训练的轮数")
-add_arg("language", type=str, default="yue", help="设置语言，可全称也可简写，如果为None则训练的是多语言")
+add_arg("num_train_epochs", type=int, default=8,      help="训练的轮数")
+add_arg("language", type=str, default="Cantonese", help="设置语言，可全称也可简写，如果为None则训练的是多语言")
 add_arg("task",     type=str, default="transcribe", choices=['transcribe', 'translate'], help="模型的任务")
 add_arg("augment_config_path",         type=str, default=None, help="数据增强配置文件路径")
 add_arg("resume_from_checkpoint",      type=str, default=None, help="恢复训练的检查点路径")
 add_arg("per_device_train_batch_size", type=int, default=2,    help="训练的batch size")
 add_arg("per_device_eval_batch_size",  type=int, default=2,    help="评估的batch size")
-add_arg("gradient_accumulation_steps", type=int, default=16,    help="梯度累积步数")
+add_arg("gradient_accumulation_steps", type=int, default=128,    help="梯度累积步数")
 add_arg("push_to_hub",                 type=bool, default=False, help="是否将模型权重推到HuggingFace Hub")
 add_arg("hub_model_id",                type=str,  default=None,  help="HuggingFace Hub上的模型仓库ID")
 add_arg("save_total_limit",            type=int,  default=10,  help="只保存最新检查点的数量")
@@ -103,11 +103,11 @@ def main():
         model = PeftModel.from_pretrained(model, args.resume_from_checkpoint, is_trainable=True)
     else:
         print(f'adding LoRA modules...')
-        target_modules = ["k_proj", "q_proj", "v_proj", "out_proj", "fc1", "fc2"]
+        target_modules = [ "q_proj", "v_proj", "out_proj","k_proj", "fc1", "fc2"]
         print(target_modules)
         if args.use_adalora:
             total_step = args.num_train_epochs * len(train_dataset)
-            config = AdaLoraConfig(init_r=24, target_r=12, beta1=0.9, beta2=0.95, tinit=1000, tfinal=total_step*0.8, deltaT=10,
+            config = AdaLoraConfig(init_r=16, target_r=8, beta1=0.9, beta2=0.95, tinit=500, tfinal=total_step*0.5, deltaT=5,
                                    lora_alpha=32, lora_dropout=0.1, orth_reg_weight=0.3, target_modules=target_modules,
                                    total_step=total_step)
         else:
